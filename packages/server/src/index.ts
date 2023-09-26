@@ -1,4 +1,4 @@
-import express, { Request, Response } from 'express'
+import express, { NextFunction, Request, Response } from 'express'
 import multer from 'multer'
 import path from 'path'
 import cors from 'cors'
@@ -16,8 +16,6 @@ import {
     IReactFlowObject,
     INodeData,
     IDatabaseExport,
-    IRunChatflowMessageValue,
-    IChildProcessMessage,
     ICredentialReturnResponse
 } from './Interface'
 import {
@@ -38,25 +36,25 @@ import {
     isSameOverrideConfig,
     replaceAllAPIKeys,
     isFlowValidForStream,
-    isVectorStoreFaiss,
     databaseEntities,
     getApiKey,
     transformToCredentialEntity,
     decryptCredentialData,
     clearSessionMemory,
     replaceInputsWithConfig,
-    getEncryptionKey
+    getEncryptionKey,
+    checkMemorySessionId
 } from './utils'
 import { cloneDeep, omit } from 'lodash'
 import { getDataSource } from './DataSource'
 import { NodesPool } from './NodesPool'
-import { ChatFlow } from './entity/ChatFlow'
-import { ChatMessage } from './entity/ChatMessage'
-import { Credential } from './entity/Credential'
-import { Tool } from './entity/Tool'
+import { ChatFlow } from './database/entities/ChatFlow'
+import { ChatMessage } from './database/entities/ChatMessage'
+import { Credential } from './database/entities/Credential'
+import { Tool } from './database/entities/Tool'
 import { ChatflowPool } from './ChatflowPool'
 import { ICommonObject, INodeOptionsValue } from 'flowise-components'
-import { fork } from 'child_process'
+import { createRateLimiter, getRateLimiter, initializeRateLimiter } from './utils/rateLimit'
 
 export class App {
     app: express.Application
@@ -74,6 +72,9 @@ export class App {
             .then(async () => {
                 logger.info('📦 [server]: Data Source has been initialized!')
 
+                // Run Migrations Scripts
+                await this.AppDataSource.runMigrations({ transaction: 'each' })
+
                 // Initialize nodes pool
                 this.nodesPool = new NodesPool()
                 await this.nodesPool.initialize()
@@ -86,6 +87,10 @@ export class App {
 
                 // Initialize encryption key
                 await getEncryptionKey()
+
+                // Initialize Rate Limit
+                const AllChatFlow: IChatFlow[] = await getAllChatFlow()
+                await initializeRateLimiter(AllChatFlow)
             })
             .catch((err) => {
                 logger.error('❌ [server]: Error during Data Source initialization:', err)
@@ -96,6 +101,9 @@ export class App {
         // Limit is needed to allow sending/receiving base64 encoded string
         this.app.use(express.json({ limit: '50mb' }))
         this.app.use(express.urlencoded({ limit: '50mb', extended: true }))
+
+        if (process.env.NUMBER_OF_PROXIES && parseInt(process.env.NUMBER_OF_PROXIES) > 0)
+            this.app.set('trust proxy', parseInt(process.env.NUMBER_OF_PROXIES))
 
         // Allow access from *
         this.app.use(cors())
@@ -116,7 +124,8 @@ export class App {
                 '/api/v1/prediction/',
                 '/api/v1/node-icon/',
                 '/api/v1/components-credentials-icon/',
-                '/api/v1/chatflows-streaming'
+                '/api/v1/chatflows-streaming',
+                '/api/v1/ip'
             ]
             this.app.use((req, res, next) => {
                 if (req.url.includes('/api/v1/')) {
@@ -126,6 +135,16 @@ export class App {
         }
 
         const upload = multer({ dest: `${path.join(__dirname, '..', 'uploads')}/` })
+
+        // ----------------------------------------
+        // Configure number of proxies in Host Environment
+        // ----------------------------------------
+        this.app.get('/api/v1/ip', (request, response) => {
+            response.send({
+                ip: request.ip,
+                msg: 'See the returned IP address in the response. If it matches your current IP address ( which you can get by going to http://ip.nfriedly.com/ or https://api.ipify.org/ ), then the number of proxies is correct and the rate limiter should now work correctly. If not, increase the number of proxies by 1 until the IP address matches your own. Visit https://docs.flowiseai.com/deployment#rate-limit-setup-guide for more information.'
+            })
+        })
 
         // ----------------------------------------
         // Components
@@ -248,7 +267,7 @@ export class App {
 
         // Get all chatflows
         this.app.get('/api/v1/chatflows', async (req: Request, res: Response) => {
-            const chatflows: IChatFlow[] = await this.AppDataSource.getRepository(ChatFlow).find()
+            const chatflows: IChatFlow[] = await getAllChatFlow()
             return res.json(chatflows)
         })
 
@@ -316,6 +335,9 @@ export class App {
             const body = req.body
             const updateChatFlow = new ChatFlow()
             Object.assign(updateChatFlow, body)
+
+            updateChatFlow.id = chatflow.id
+            createRateLimiter(updateChatFlow)
 
             this.AppDataSource.getRepository(ChatFlow).merge(chatflow, updateChatFlow)
             const result = await this.AppDataSource.getRepository(ChatFlow).save(chatflow)
@@ -574,6 +596,34 @@ export class App {
             return res.json(availableConfigs)
         })
 
+        this.app.get('/api/v1/version', async (req: Request, res: Response) => {
+            const getPackageJsonPath = (): string => {
+                const checkPaths = [
+                    path.join(__dirname, '..', 'package.json'),
+                    path.join(__dirname, '..', '..', 'package.json'),
+                    path.join(__dirname, '..', '..', '..', 'package.json'),
+                    path.join(__dirname, '..', '..', '..', '..', 'package.json'),
+                    path.join(__dirname, '..', '..', '..', '..', '..', 'package.json')
+                ]
+                for (const checkPath of checkPaths) {
+                    if (fs.existsSync(checkPath)) {
+                        return checkPath
+                    }
+                }
+                return ''
+            }
+
+            const packagejsonPath = getPackageJsonPath()
+            if (!packagejsonPath) return res.status(404).send('Version not found')
+            try {
+                const content = await fs.promises.readFile(packagejsonPath, 'utf8')
+                const parsedContent = JSON.parse(content)
+                return res.json({ version: parsedContent.version })
+            } catch (error) {
+                return res.status(500).send(`Version not found: ${error}`)
+            }
+        })
+
         // ----------------------------------------
         // Export Load Chatflow & ChatMessage & Apikeys
         // ----------------------------------------
@@ -630,9 +680,14 @@ export class App {
         // ----------------------------------------
 
         // Send input message and get prediction result (External)
-        this.app.post('/api/v1/prediction/:id', upload.array('files'), async (req: Request, res: Response) => {
-            await this.processPrediction(req, res, socketIO)
-        })
+        this.app.post(
+            '/api/v1/prediction/:id',
+            upload.array('files'),
+            (req: Request, res: Response, next: NextFunction) => getRateLimiter(req, res, next),
+            async (req: Request, res: Response) => {
+                await this.processPrediction(req, res, socketIO)
+            }
+        )
 
         // Send input message and get prediction result (Internal)
         this.app.post('/api/v1/internal-prediction/:id', async (req: Request, res: Response) => {
@@ -661,7 +716,11 @@ export class App {
                 templates.push(template)
             })
             const FlowiseDocsQnA = templates.find((tmp) => tmp.name === 'Flowise Docs QnA')
-            if (FlowiseDocsQnA) templates.unshift(FlowiseDocsQnA)
+            const FlowiseDocsQnAIndex = templates.findIndex((tmp) => tmp.name === 'Flowise Docs QnA')
+            if (FlowiseDocsQnA && FlowiseDocsQnAIndex > 0) {
+                templates.splice(FlowiseDocsQnAIndex, 1)
+                templates.unshift(FlowiseDocsQnA)
+            }
             return res.json(templates)
         })
 
@@ -760,68 +819,6 @@ export class App {
     }
 
     /**
-     * Start child process
-     * @param {ChatFlow} chatflow
-     * @param {IncomingInput} incomingInput
-     * @param {INodeData} endingNodeData
-     */
-    async startChildProcess(chatflow: ChatFlow, chatId: string, incomingInput: IncomingInput, endingNodeData?: INodeData) {
-        try {
-            const controller = new AbortController()
-            const { signal } = controller
-
-            let childpath = path.join(__dirname, '..', 'dist', 'ChildProcess.js')
-            if (!fs.existsSync(childpath)) childpath = 'ChildProcess.ts'
-
-            const childProcess = fork(childpath, [], { signal })
-
-            const value = {
-                chatflow,
-                chatId,
-                incomingInput,
-                componentNodes: cloneDeep(this.nodesPool.componentNodes),
-                endingNodeData
-            } as IRunChatflowMessageValue
-            childProcess.send({ key: 'start', value } as IChildProcessMessage)
-
-            let childProcessTimeout: NodeJS.Timeout
-
-            return new Promise((resolve, reject) => {
-                childProcess.on('message', async (message: IChildProcessMessage) => {
-                    if (message.key === 'finish') {
-                        const { result, addToChatFlowPool } = message.value as ICommonObject
-                        if (childProcessTimeout) {
-                            clearTimeout(childProcessTimeout)
-                        }
-                        if (Object.keys(addToChatFlowPool).length) {
-                            const { chatflowid, nodeToExecuteData, startingNodes, overrideConfig } = addToChatFlowPool
-                            this.chatflowPool.add(chatflowid, nodeToExecuteData, startingNodes, overrideConfig)
-                        }
-                        resolve(result)
-                    }
-                    if (message.key === 'start') {
-                        if (process.env.EXECUTION_TIMEOUT) {
-                            childProcessTimeout = setTimeout(async () => {
-                                childProcess.kill()
-                                resolve(undefined)
-                            }, parseInt(process.env.EXECUTION_TIMEOUT, 10))
-                        }
-                    }
-                    if (message.key === 'error') {
-                        let errMessage = message.value as string
-                        if (childProcessTimeout) {
-                            clearTimeout(childProcessTimeout)
-                        }
-                        reject(errMessage)
-                    }
-                })
-            })
-        } catch (err) {
-            logger.error('[server] [mode:child]: Error:', err)
-        }
-    }
-
-    /**
      * Process Prediction
      * @param {Request} req
      * @param {Response} res
@@ -867,15 +864,22 @@ export class App {
                 incomingInput = {
                     question: req.body.question ?? 'hello',
                     overrideConfig,
-                    history: []
+                    history: [],
+                    socketIOClientId: req.body.socketIOClientId
                 }
             }
+
+            /*** Get chatflows and prepare data  ***/
+            const flowData = chatflow.flowData
+            const parsedFlowData: IReactFlowObject = JSON.parse(flowData)
+            const nodes = parsedFlowData.nodes
+            const edges = parsedFlowData.edges
 
             /*   Reuse the flow without having to rebuild (to avoid duplicated upsert, recomputation) when all these conditions met:
              * - Node Data already exists in pool
              * - Still in sync (i.e the flow has not been modified since)
              * - Existing overrideConfig and new overrideConfig are the same
-             * - Flow doesn't start with nodes that depend on incomingInput.question
+             * - Flow doesn't start with/contain nodes that depend on incomingInput.question
              ***/
             const isFlowReusable = () => {
                 return (
@@ -886,126 +890,109 @@ export class App {
                         this.chatflowPool.activeChatflows[chatflowid].overrideConfig,
                         incomingInput.overrideConfig
                     ) &&
-                    !isStartNodeDependOnInput(this.chatflowPool.activeChatflows[chatflowid].startingNodes)
+                    !isStartNodeDependOnInput(this.chatflowPool.activeChatflows[chatflowid].startingNodes, nodes)
                 )
             }
 
-            if (process.env.EXECUTION_MODE === 'child') {
-                if (isFlowReusable()) {
-                    nodeToExecuteData = this.chatflowPool.activeChatflows[chatflowid].endingNodeData
-                    logger.debug(
-                        `[server] [mode:child]: Reuse existing chatflow ${chatflowid} with ending node ${nodeToExecuteData.label} (${nodeToExecuteData.id})`
-                    )
-                    try {
-                        const result = await this.startChildProcess(chatflow, chatId, incomingInput, nodeToExecuteData)
-                        return res.json(result)
-                    } catch (error) {
-                        return res.status(500).send(error)
-                    }
-                } else {
-                    try {
-                        const result = await this.startChildProcess(chatflow, chatId, incomingInput)
-                        return res.json(result)
-                    } catch (error) {
-                        return res.status(500).send(error)
-                    }
-                }
+            if (isFlowReusable()) {
+                nodeToExecuteData = this.chatflowPool.activeChatflows[chatflowid].endingNodeData
+                isStreamValid = isFlowValidForStream(nodes, nodeToExecuteData)
+                logger.debug(
+                    `[server]: Reuse existing chatflow ${chatflowid} with ending node ${nodeToExecuteData.label} (${nodeToExecuteData.id})`
+                )
             } else {
-                /*** Get chatflows and prepare data  ***/
-                const flowData = chatflow.flowData
-                const parsedFlowData: IReactFlowObject = JSON.parse(flowData)
-                const nodes = parsedFlowData.nodes
-                const edges = parsedFlowData.edges
+                /*** Get Ending Node with Directed Graph  ***/
+                const { graph, nodeDependencies } = constructGraphs(nodes, edges)
+                const directedGraph = graph
+                const endingNodeId = getEndingNode(nodeDependencies, directedGraph)
+                if (!endingNodeId) return res.status(500).send(`Ending node ${endingNodeId} not found`)
 
-                if (isFlowReusable()) {
-                    nodeToExecuteData = this.chatflowPool.activeChatflows[chatflowid].endingNodeData
-                    isStreamValid = isFlowValidForStream(nodes, nodeToExecuteData)
-                    logger.debug(
-                        `[server]: Reuse existing chatflow ${chatflowid} with ending node ${nodeToExecuteData.label} (${nodeToExecuteData.id})`
-                    )
-                } else {
-                    /*** Get Ending Node with Directed Graph  ***/
-                    const { graph, nodeDependencies } = constructGraphs(nodes, edges)
-                    const directedGraph = graph
-                    const endingNodeId = getEndingNode(nodeDependencies, directedGraph)
-                    if (!endingNodeId) return res.status(500).send(`Ending node ${endingNodeId} not found`)
+                const endingNodeData = nodes.find((nd) => nd.id === endingNodeId)?.data
+                if (!endingNodeData) return res.status(500).send(`Ending node ${endingNodeId} data not found`)
 
-                    const endingNodeData = nodes.find((nd) => nd.id === endingNodeId)?.data
-                    if (!endingNodeData) return res.status(500).send(`Ending node ${endingNodeId} data not found`)
-
-                    if (endingNodeData && endingNodeData.category !== 'Chains' && endingNodeData.category !== 'Agents') {
-                        return res.status(500).send(`Ending node must be either a Chain or Agent`)
-                    }
-
-                    if (
-                        endingNodeData.outputs &&
-                        Object.keys(endingNodeData.outputs).length &&
-                        !Object.values(endingNodeData.outputs).includes(endingNodeData.name)
-                    ) {
-                        return res
-                            .status(500)
-                            .send(
-                                `Output of ${endingNodeData.label} (${endingNodeData.id}) must be ${endingNodeData.label}, can't be an Output Prediction`
-                            )
-                    }
-
-                    isStreamValid = isFlowValidForStream(nodes, endingNodeData)
-
-                    /*** Get Starting Nodes with Non-Directed Graph ***/
-                    const constructedObj = constructGraphs(nodes, edges, true)
-                    const nonDirectedGraph = constructedObj.graph
-                    const { startingNodeIds, depthQueue } = getStartingNodes(nonDirectedGraph, endingNodeId)
-
-                    logger.debug(`[server]: Start building chatflow ${chatflowid}`)
-                    /*** BFS to traverse from Starting Nodes to Ending Node ***/
-                    const reactFlowNodes = await buildLangchain(
-                        startingNodeIds,
-                        nodes,
-                        graph,
-                        depthQueue,
-                        this.nodesPool.componentNodes,
-                        incomingInput.question,
-                        chatId,
-                        this.AppDataSource,
-                        incomingInput?.overrideConfig
-                    )
-
-                    const nodeToExecute = reactFlowNodes.find((node: IReactFlowNode) => node.id === endingNodeId)
-                    if (!nodeToExecute) return res.status(404).send(`Node ${endingNodeId} not found`)
-
-                    if (incomingInput.overrideConfig)
-                        nodeToExecute.data = replaceInputsWithConfig(nodeToExecute.data, incomingInput.overrideConfig)
-                    const reactFlowNodeData: INodeData = resolveVariables(nodeToExecute.data, reactFlowNodes, incomingInput.question)
-                    nodeToExecuteData = reactFlowNodeData
-
-                    const startingNodes = nodes.filter((nd) => startingNodeIds.includes(nd.id))
-                    this.chatflowPool.add(chatflowid, nodeToExecuteData, startingNodes, incomingInput?.overrideConfig)
+                if (endingNodeData && endingNodeData.category !== 'Chains' && endingNodeData.category !== 'Agents') {
+                    return res.status(500).send(`Ending node must be either a Chain or Agent`)
                 }
 
-                const nodeInstanceFilePath = this.nodesPool.componentNodes[nodeToExecuteData.name].filePath as string
-                const nodeModule = await import(nodeInstanceFilePath)
-                const nodeInstance = new nodeModule.nodeClass()
+                if (
+                    endingNodeData.outputs &&
+                    Object.keys(endingNodeData.outputs).length &&
+                    !Object.values(endingNodeData.outputs).includes(endingNodeData.name)
+                ) {
+                    return res
+                        .status(500)
+                        .send(
+                            `Output of ${endingNodeData.label} (${endingNodeData.id}) must be ${endingNodeData.label}, can't be an Output Prediction`
+                        )
+                }
 
-                isStreamValid = isStreamValid && !isVectorStoreFaiss(nodeToExecuteData)
-                logger.debug(`[server]: Running ${nodeToExecuteData.label} (${nodeToExecuteData.id})`)
-                const result = isStreamValid
-                    ? await nodeInstance.run(nodeToExecuteData, incomingInput.question, {
-                          chatHistory: incomingInput.history,
-                          socketIO,
-                          socketIOClientId: incomingInput.socketIOClientId,
-                          logger,
-                          appDataSource: this.AppDataSource,
-                          databaseEntities
-                      })
-                    : await nodeInstance.run(nodeToExecuteData, incomingInput.question, {
-                          chatHistory: incomingInput.history,
-                          logger,
-                          appDataSource: this.AppDataSource,
-                          databaseEntities
-                      })
-                logger.debug(`[server]: Finished running ${nodeToExecuteData.label} (${nodeToExecuteData.id})`)
-                return res.json(result)
+                isStreamValid = isFlowValidForStream(nodes, endingNodeData)
+
+                /*** Get Starting Nodes with Non-Directed Graph ***/
+                const constructedObj = constructGraphs(nodes, edges, true)
+                const nonDirectedGraph = constructedObj.graph
+                const { startingNodeIds, depthQueue } = getStartingNodes(nonDirectedGraph, endingNodeId)
+
+                logger.debug(`[server]: Start building chatflow ${chatflowid}`)
+                /*** BFS to traverse from Starting Nodes to Ending Node ***/
+                const reactFlowNodes = await buildLangchain(
+                    startingNodeIds,
+                    nodes,
+                    graph,
+                    depthQueue,
+                    this.nodesPool.componentNodes,
+                    incomingInput.question,
+                    incomingInput.history,
+                    chatId,
+                    this.AppDataSource,
+                    incomingInput?.overrideConfig
+                )
+
+                const nodeToExecute = reactFlowNodes.find((node: IReactFlowNode) => node.id === endingNodeId)
+                if (!nodeToExecute) return res.status(404).send(`Node ${endingNodeId} not found`)
+
+                if (incomingInput.overrideConfig)
+                    nodeToExecute.data = replaceInputsWithConfig(nodeToExecute.data, incomingInput.overrideConfig)
+                const reactFlowNodeData: INodeData = resolveVariables(
+                    nodeToExecute.data,
+                    reactFlowNodes,
+                    incomingInput.question,
+                    incomingInput.history
+                )
+                nodeToExecuteData = reactFlowNodeData
+
+                const startingNodes = nodes.filter((nd) => startingNodeIds.includes(nd.id))
+                this.chatflowPool.add(chatflowid, nodeToExecuteData, startingNodes, incomingInput?.overrideConfig)
             }
+
+            const nodeInstanceFilePath = this.nodesPool.componentNodes[nodeToExecuteData.name].filePath as string
+            const nodeModule = await import(nodeInstanceFilePath)
+            const nodeInstance = new nodeModule.nodeClass()
+
+            logger.debug(`[server]: Running ${nodeToExecuteData.label} (${nodeToExecuteData.id})`)
+
+            if (nodeToExecuteData.instance) checkMemorySessionId(nodeToExecuteData.instance, chatId)
+
+            const result = isStreamValid
+                ? await nodeInstance.run(nodeToExecuteData, incomingInput.question, {
+                      chatHistory: incomingInput.history,
+                      socketIO,
+                      socketIOClientId: incomingInput.socketIOClientId,
+                      logger,
+                      appDataSource: this.AppDataSource,
+                      databaseEntities,
+                      analytic: chatflow.analytic
+                  })
+                : await nodeInstance.run(nodeToExecuteData, incomingInput.question, {
+                      chatHistory: incomingInput.history,
+                      logger,
+                      appDataSource: this.AppDataSource,
+                      databaseEntities,
+                      analytic: chatflow.analytic
+                  })
+
+            logger.debug(`[server]: Finished running ${nodeToExecuteData.label} (${nodeToExecuteData.id})`)
+            return res.json(result)
         } catch (e: any) {
             logger.error('[server]: Error:', e)
             return res.status(500).send(e.message)
@@ -1040,6 +1027,10 @@ export async function getChatId(chatflowid: string) {
 }
 
 let serverApp: App | undefined
+
+export async function getAllChatFlow(): Promise<IChatFlow[]> {
+    return await getDataSource().getRepository(ChatFlow).find()
+}
 
 export async function start(): Promise<void> {
     serverApp = new App()

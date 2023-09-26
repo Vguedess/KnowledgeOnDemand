@@ -14,7 +14,9 @@ export interface IChatFlow {
     deployed?: boolean
     isPublic?: boolean
     apikeyid?: string
+    analytic?: string
     chatbotConfig?: string
+    apiConfig?: any
 }
 
 export interface IChatMessage {
@@ -167,19 +169,6 @@ export interface IDatabaseExport {
     chatmessages: IChatMessage[]
     chatflows: IChatFlow[]
     apikeys: ICommonObject[]
-}
-
-export interface IRunChatflowMessageValue {
-    chatflow: IChatFlow
-    chatId: string
-    incomingInput: IncomingInput
-    componentNodes: IComponentNodes
-    endingNodeData?: INodeData
-}
-
-export interface IChildProcessMessage {
-    key: string
-    value?: any
 }
 
 export type ICredentialDataDecrypted = ICommonObject
