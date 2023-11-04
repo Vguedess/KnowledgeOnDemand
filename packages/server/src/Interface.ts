@@ -2,6 +2,10 @@ import { ICommonObject, INode, INodeData as INodeDataFromComponent, INodeParams 
 
 export type MessageType = 'apiMessage' | 'userMessage'
 
+export enum chatType {
+    INTERNAL = 'INTERNAL',
+    EXTERNAL = 'EXTERNAL'
+}
 /**
  * Databases
  */
@@ -24,8 +28,12 @@ export interface IChatMessage {
     role: MessageType
     content: string
     chatflowid: string
-    createdDate: Date
     sourceDocuments?: string
+    chatType: string
+    chatId: string
+    memoryType?: string
+    sessionId?: string
+    createdDate: Date
 }
 
 export interface ITool {
@@ -146,6 +154,7 @@ export interface IncomingInput {
     history: IMessage[]
     overrideConfig?: ICommonObject
     socketIOClientId?: string
+    chatId?: string
 }
 
 export interface IActiveChatflows {
@@ -155,6 +164,10 @@ export interface IActiveChatflows {
         inSync: boolean
         overrideConfig?: ICommonObject
     }
+}
+
+export interface IActiveCache {
+    [key: string]: Map<any, any>
 }
 
 export interface IOverrideConfig {
