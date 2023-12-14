@@ -344,7 +344,7 @@
                     }
                 ],
                 "inputs": {
-                    "url": "https://flowiseai.com/",
+                    "url": "https://beyondcurve.app/",
                     "textSplitter": "{{htmlToMarkdownTextSplitter_0.data.instance}}",
                     "relativeLinksMethod": "",
                     "limit": "",
